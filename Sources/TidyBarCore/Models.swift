@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 Foundation、AppKit（NSEvent.ModifierFlags）、Carbon（修饰键常量）、CoreGraphics（CGRect/CGWindowID）
- * [OUTPUT]: 提供 DisplayMode、ToggleIconStyle、DividerStyle、AutoRehideDelay、MenuBarSection、HotkeyCombo、MenuBarItemInfo 与 TidyBarSettings
+ * [OUTPUT]: 提供 DisplayMode、ToggleIconStyle、DividerStyle、AutoRehideDelay、MenuBarSection、HotkeyCombo、MenuBarItemInfo（含系统内置项中文名称与 SF Symbol 映射）与 TidyBarSettings
  * [POS]: TidyBarCore 的核心领域模型层，为配置存储、布局引擎、扫描器与界面层提供统一契约
  * [PROTOCOL]: Update this header on change, then check GEMINI.md
  */
@@ -127,11 +127,79 @@ public struct MenuBarItemInfo: Equatable, Sendable {
     }
 
     public var displayLabel: String {
+        if let localized = Self.localizedSystemLabel(ownerName: ownerName, title: title) {
+            return localized
+        }
         let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedTitle.isEmpty, trimmedTitle != ownerName {
             return "\(ownerName) - \(trimmedTitle)"
         }
         return ownerName.isEmpty ? "未命名状态图标" : ownerName
+    }
+
+    public static func localizedSystemLabel(ownerName: String, title: String) -> String? {
+        systemModuleMetadata(ownerName: ownerName, title: title)?.label
+    }
+
+    public static func suggestedSystemSymbolName(ownerName: String, title: String) -> String? {
+        systemModuleMetadata(ownerName: ownerName, title: title)?.symbol
+    }
+
+    private static func systemModuleMetadata(
+        ownerName: String,
+        title: String
+    ) -> (label: String, symbol: String)? {
+        let trimmedOwner = ownerName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowerTitle = trimmedTitle.lowercased()
+
+        if trimmedOwner.contains("TextInput") {
+            return ("输入法", "keyboard")
+        }
+        if trimmedOwner == "Spotlight" || trimmedOwner == "聚焦" {
+            return ("聚焦搜索", "magnifyingglass")
+        }
+        if trimmedOwner == "Siri" {
+            return ("Siri", "sparkles")
+        }
+
+        let isControlCenter = trimmedOwner == "控制中心"
+            || trimmedOwner == "ControlCenter"
+            || trimmedOwner == "Control Center"
+        guard isControlCenter else { return nil }
+
+        let controlCenterMap: [(match: String, label: String, symbol: String)] = [
+            ("bentobox", "控制中心", "switch.2"),
+            ("clock", "时钟与日期", "clock"),
+            ("battery", "电池", "battery.100"),
+            ("display", "显示器", "display"),
+            ("screenmirroring", "显示器镜像", "rectangle.on.rectangle"),
+            ("wifi", "Wi-Fi", "wifi"),
+            ("wi-fi", "Wi-Fi", "wifi"),
+            ("bluetooth", "蓝牙", "dot.radiowaves.left.and.right"),
+            ("sound", "声音", "speaker.wave.2"),
+            ("audio", "声音", "speaker.wave.2"),
+            ("focus", "专注模式", "moon.fill"),
+            ("nowplaying", "正在播放", "play.circle"),
+            ("airdrop", "隔空投送", "antenna.radiowaves.left.and.right"),
+            ("stagemanager", "台前调度", "squares.leading.rectangle"),
+            ("keyboardbrightness", "键盘亮度", "light.max"),
+            ("userswitcher", "快速用户切换", "person.crop.circle"),
+            ("accessibility", "辅助功能", "accessibility"),
+            ("weather", "天气", "cloud.sun"),
+            ("spotlight", "聚焦搜索", "magnifyingglass"),
+            ("siri", "Siri", "sparkles"),
+            ("timemachine", "时间机器", "clock.arrow.circlepath"),
+            ("vpn", "VPN", "network.badge.shield.half.filled")
+        ]
+
+        for entry in controlCenterMap where lowerTitle.contains(entry.match) {
+            return (entry.label, entry.symbol)
+        }
+        if trimmedTitle.isEmpty {
+            return ("控制中心", "switch.2")
+        }
+        return ("控制中心 · \(trimmedTitle)", "switch.2")
     }
 }
 

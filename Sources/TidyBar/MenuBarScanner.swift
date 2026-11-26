@@ -154,25 +154,26 @@ enum MenuBarScanner {
     }
 
     private static func resolveAppIcon(for info: MenuBarItemInfo) -> NSImage {
+        if let symbolName = MenuBarItemInfo.suggestedSystemSymbolName(ownerName: info.ownerName, title: info.title) {
+            return renderSystemSymbol(name: symbolName, accessibilityLabel: info.displayLabel)
+        }
+
         if let appIcon = NSRunningApplication(processIdentifier: info.ownerPID)?.icon {
             let copy = (appIcon.copy() as? NSImage) ?? appIcon
             copy.size = NSSize(width: 18, height: 18)
             return copy
         }
 
-        let symbolName: String
-        let owner = info.ownerName
-        if owner.contains("TextInput") {
-            symbolName = "keyboard"
-        } else if owner == "控制中心" || owner == "ControlCenter" || owner == "Control Center" {
-            symbolName = "switch.2"
-        } else {
-            symbolName = "app.dashed"
-        }
+        return renderSystemSymbol(name: "app.dashed", accessibilityLabel: info.displayLabel)
+    }
 
-        let symbol = NSImage(systemSymbolName: symbolName, accessibilityDescription: owner)
+    private static func renderSystemSymbol(name: String, accessibilityLabel: String) -> NSImage {
+        let base = NSImage(systemSymbolName: name, accessibilityDescription: accessibilityLabel)
             ?? NSImage(size: NSSize(width: 18, height: 18))
-        let copy = (symbol.copy() as? NSImage) ?? symbol
+        let config = NSImage.SymbolConfiguration(pointSize: 13.5, weight: .medium)
+        let configured = base.withSymbolConfiguration(config) ?? base
+        let copy = (configured.copy() as? NSImage) ?? configured
+        copy.isTemplate = true
         copy.size = NSSize(width: 18, height: 18)
         return copy
     }

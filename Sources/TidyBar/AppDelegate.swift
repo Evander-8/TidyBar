@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 AppKit、TidyBarCore（SettingsStore、HotkeyManager）与 MenuBarController、SettingsWindowController
- * [OUTPUT]: 提供 AppDelegate 应用生命周期协调器（单实例防重、状态栏与热键装配、首次启动引导弹窗）
+ * [OUTPUT]: 提供 AppDelegate 应用生命周期协调器（单实例防重、状态栏与热键装配、首次启动弹窗、退出/关机前收缩分割线）
  * [POS]: TidyBar 应用壳核心代理，负责串联无界面核心与 AppKit 界面层
  * [PROTOCOL]: Update this header on change, then check GEMINI.md
  */
@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var menuBarController: MenuBarController?
     private var settingsWindowController: SettingsWindowController?
+    private var powerOffObserver: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if terminateIfDuplicateInstanceRunning() {
@@ -89,6 +90,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 settingsWC?.show(tab: 0)
             }
         }
+
+        powerOffObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.willPowerOffNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.menuBarController?.resetDividersToCompact()
+            }
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        if let obs = powerOffObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(obs)
+            powerOffObserver = nil
+        }
+        menuBarController?.resetDividersToCompact()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

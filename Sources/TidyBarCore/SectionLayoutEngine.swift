@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 CoreGraphics、Foundation 与 Models（MenuBarItemInfo、MenuBarSection）
- * [OUTPUT]: 提供 SectionLayoutEngine 几何引擎（防自锁顺序校验、三段式分区、二级下拉栏定位、刘海盲区判定）
+ * [OUTPUT]: 提供 SectionLayoutEngine 几何引擎（防自锁顺序校验、按 WindowID 识别自身窗口与出屏硬守卫、三段式分区、二级下拉栏定位、刘海盲区判定）
  * [POS]: TidyBarCore 的纯几何算法中枢，所有状态栏边界计算与防自锁不变量均在此集中验证
  * [PROTOCOL]: Update this header on change, then check GEMINI.md
  */
@@ -144,27 +144,38 @@ public enum SectionLayoutEngine {
         )
     }
 
-    /// 从当前屏幕菜单栏中按从右到左顺序识别自身 2-3 个状态栏窗口（toggle / hiddenDivider / alwaysHiddenDivider）
+    /// 严格按真实 CGWindowID 识别自身 2-3 个状态栏窗口（绝不按 maxX 排序盲猜，防止倒置时身份互换绕过防自锁）
     public static func classifyOwnStatusWindows(
         _ rawItems: [RawStatusWindow],
         ownPID: pid_t,
         menuBarCGMinY: CGFloat,
+        toggleWindowID: CGWindowID,
+        hiddenDividerWindowID: CGWindowID,
+        alwaysHiddenDividerWindowID: CGWindowID?,
         verticalTolerance: CGFloat = 10.0
     ) -> (toggle: RawStatusWindow?, hiddenDivider: RawStatusWindow?, alwaysHiddenDivider: RawStatusWindow?) {
-        let own = rawItems
-            .filter {
-                $0.ownerPID == ownPID
-                    && abs($0.cgFrame.minY - menuBarCGMinY) <= verticalTolerance
-                    && $0.cgFrame.height > 10
-                    && $0.cgFrame.height <= 48
-                    && $0.cgFrame.width >= 4
-            }
-            .sorted { $0.cgFrame.maxX > $1.cgFrame.maxX }
+        let own = rawItems.filter {
+            $0.ownerPID == ownPID
+                && abs($0.cgFrame.minY - menuBarCGMinY) <= verticalTolerance
+                && $0.cgFrame.height > 10
+                && $0.cgFrame.height <= 48
+                && $0.cgFrame.width >= 4
+        }
 
-        let toggle = own.indices.contains(0) ? own[0] : nil
-        let hidden = own.indices.contains(1) ? own[1] : nil
-        let always = own.indices.contains(2) ? own[2] : nil
+        let toggle = own.first { $0.windowID == toggleWindowID }
+        let hidden = own.first { $0.windowID == hiddenDividerWindowID }
+        let always = alwaysHiddenDividerWindowID.flatMap { targetID in
+            own.first { $0.windowID == targetID }
+        }
         return (toggle, hidden, always)
+    }
+
+    /// 判定主开关是否已被推出当前屏幕可见区间外（防自锁硬守卫）
+    public static func isToggleOffScreen(
+        toggleCGFrame: CGRect,
+        screenCGFrame: CGRect
+    ) -> Bool {
+        toggleCGFrame.maxX <= screenCGFrame.minX + 2 || toggleCGFrame.minX >= screenCGFrame.maxX - 2
     }
 
     /// 计算将图标通过 Command+Drag 移入目标分区时在 CG 坐标系下的落点
@@ -248,7 +259,7 @@ public enum SectionLayoutEngine {
             return true
         }
         let lowerTitle = title.lowercased()
-        if lowerTitle.contains("clock") || title.contains("时钟") {
+        if lowerTitle.contains("clock") || lowerTitle.contains("bentobox") || title.contains("时钟") {
             return true
         }
         return false

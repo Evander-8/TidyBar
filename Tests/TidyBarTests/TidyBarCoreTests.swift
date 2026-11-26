@@ -224,21 +224,37 @@ final class TidyBarCoreTests: XCTestCase {
         XCTAssertEqual(partitioned.visible.map(\.ownerName), ["WeChat"])
     }
 
-    func testClassifyOwnStatusWindowsIdentifiesRightToLeftOrder() {
+    func testClassifyOwnStatusWindowsMatchesExactWindowIDsWithoutSwappingInvertedOrder() {
         let ownPID: pid_t = 999
+        let screenCG = CGRect(x: 0, y: 0, width: 1800, height: 1169)
         let raw: [RawStatusWindow] = [
             // 副屏自身副本应被忽略
-            RawStatusWindow(windowID: 1, ownerPID: ownPID, ownerName: "TidyBar", title: "", cgFrame: CGRect(x: -560, y: 89, width: 40, height: 24), isOnScreen: true),
-            // 主屏自身 3 个窗口
-            RawStatusWindow(windowID: 2, ownerPID: ownPID, ownerName: "TidyBar", title: "", cgFrame: CGRect(x: 1000, y: 0, width: 12, height: 43), isOnScreen: true),
-            RawStatusWindow(windowID: 3, ownerPID: ownPID, ownerName: "TidyBar", title: "", cgFrame: CGRect(x: 1242, y: 0, width: 24, height: 43), isOnScreen: true),
-            RawStatusWindow(windowID: 4, ownerPID: ownPID, ownerName: "TidyBar", title: "", cgFrame: CGRect(x: 1180, y: 0, width: 10, height: 43), isOnScreen: true)
+            RawStatusWindow(windowID: 50, ownerPID: ownPID, ownerName: "TidyBar", title: "", cgFrame: CGRect(x: -5474, y: 89, width: 40, height: 24), isOnScreen: false),
+            // 模拟真实事故现场：hiddenDivider (51) 跑到了 toggle (49) 右侧，把 toggle 挤出屏幕左缘
+            RawStatusWindow(windowID: 53, ownerPID: ownPID, ownerName: "TidyBar", title: "", cgFrame: CGRect(x: -8884, y: 0, width: 5016, height: 43), isOnScreen: false),
+            RawStatusWindow(windowID: 51, ownerPID: ownPID, ownerName: "TidyBar", title: "", cgFrame: CGRect(x: -3632, y: 0, width: 5016, height: 43), isOnScreen: false),
+            RawStatusWindow(windowID: 49, ownerPID: ownPID, ownerName: "TidyBar", title: "", cgFrame: CGRect(x: -3672, y: 0, width: 40, height: 43), isOnScreen: false)
         ]
 
-        let classified = SectionLayoutEngine.classifyOwnStatusWindows(raw, ownPID: ownPID, menuBarCGMinY: 0)
-        XCTAssertEqual(classified.toggle?.windowID, 3)
-        XCTAssertEqual(classified.hiddenDivider?.windowID, 4)
-        XCTAssertEqual(classified.alwaysHiddenDivider?.windowID, 2)
+        let classified = SectionLayoutEngine.classifyOwnStatusWindows(
+            raw,
+            ownPID: ownPID,
+            menuBarCGMinY: 0,
+            toggleWindowID: 49,
+            hiddenDividerWindowID: 51,
+            alwaysHiddenDividerWindowID: 53
+        )
+        XCTAssertEqual(classified.toggle?.windowID, 49)
+        XCTAssertEqual(classified.hiddenDivider?.windowID, 51)
+        XCTAssertEqual(classified.alwaysHiddenDivider?.windowID, 53)
+
+        let validation = SectionLayoutEngine.validateDividerOrder(
+            toggleFrame: classified.toggle!.cgFrame,
+            hiddenDividerFrame: classified.hiddenDivider!.cgFrame,
+            alwaysHiddenDividerFrame: classified.alwaysHiddenDivider?.cgFrame
+        )
+        XCTAssertEqual(validation, .hiddenDividerRightOfToggle)
+        XCTAssertTrue(SectionLayoutEngine.isToggleOffScreen(toggleCGFrame: classified.toggle!.cgFrame, screenCGFrame: screenCG))
     }
 
     func testComputeMoveDestinationTargetsExactZones() {
@@ -366,5 +382,68 @@ final class TidyBarCoreTests: XCTestCase {
             attemptOffset: 40
         )
         XCTAssertLessThanOrEqual(clampedDest.x, 1800 - 12)
+    }
+
+    func testSystemMenuBarItemLocalizationAndPinnedDetection() {
+        let display = MenuBarItemInfo(
+            windowID: 1,
+            ownerPID: 10,
+            ownerName: "控制中心",
+            title: "Display",
+            cgFrame: CGRect(x: 1526, y: 0, width: 36, height: 43),
+            section: .visible,
+            isOnScreen: true
+        )
+        XCTAssertEqual(display.displayLabel, "显示器")
+        XCTAssertEqual(MenuBarItemInfo.suggestedSystemSymbolName(ownerName: display.ownerName, title: display.title), "display")
+
+        let battery = MenuBarItemInfo(
+            windowID: 2,
+            ownerPID: 10,
+            ownerName: "控制中心",
+            title: "Battery",
+            cgFrame: CGRect(x: 1562, y: 0, width: 76, height: 43),
+            section: .visible,
+            isOnScreen: true
+        )
+        XCTAssertEqual(battery.displayLabel, "电池")
+        XCTAssertEqual(MenuBarItemInfo.suggestedSystemSymbolName(ownerName: battery.ownerName, title: battery.title), "battery.100")
+
+        let bento = MenuBarItemInfo(
+            windowID: 3,
+            ownerPID: 10,
+            ownerName: "控制中心",
+            title: "BentoBox",
+            cgFrame: CGRect(x: 1638, y: 0, width: 34, height: 43),
+            section: .visible,
+            isOnScreen: true
+        )
+        XCTAssertEqual(bento.displayLabel, "控制中心")
+        XCTAssertEqual(MenuBarItemInfo.suggestedSystemSymbolName(ownerName: bento.ownerName, title: bento.title), "switch.2")
+        XCTAssertTrue(SectionLayoutEngine.isLikelySystemPinnedItem(ownerName: bento.ownerName, title: bento.title, cgFrame: bento.cgFrame, screenMaxX: 1800))
+
+        let inputMethod = MenuBarItemInfo(
+            windowID: 4,
+            ownerPID: 20,
+            ownerName: "TextInputMenuAgent",
+            title: "",
+            cgFrame: CGRect(x: 1100, y: 0, width: 44, height: 43),
+            section: .hidden,
+            isOnScreen: false
+        )
+        XCTAssertEqual(inputMethod.displayLabel, "输入法")
+        XCTAssertEqual(MenuBarItemInfo.suggestedSystemSymbolName(ownerName: inputMethod.ownerName, title: inputMethod.title), "keyboard")
+
+        let thirdParty = MenuBarItemInfo(
+            windowID: 5,
+            ownerPID: 30,
+            ownerName: "微信",
+            title: "",
+            cgFrame: CGRect(x: 1488, y: 0, width: 38, height: 43),
+            section: .visible,
+            isOnScreen: true
+        )
+        XCTAssertEqual(thirdParty.displayLabel, "微信")
+        XCTAssertNil(MenuBarItemInfo.suggestedSystemSymbolName(ownerName: thirdParty.ownerName, title: thirdParty.title))
     }
 }
