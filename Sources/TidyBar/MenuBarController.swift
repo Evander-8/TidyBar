@@ -1,7 +1,7 @@
 /**
- * [INPUT]: 依赖 AppKit、TidyBarCore（SettingsStore、SectionLayoutEngine、PermissionManager、MenuBarMoveResult）与视觉/扫描/移动/转发组件
- * [OUTPUT]: 提供 MenuBarController（管理三段式 NSStatusItem、防自锁折叠与自愈重建、空分区不自藏分割线、可视化移动协调与右键菜单）
- * [POS]: TidyBar 的核心常驻控制器，既驱动顶部状态栏折叠与二级下拉栏，也为设置窗口提供图标扫描与重排入口
+ * [INPUT]: 依赖 AppKit、TidyBarCore（SettingsStore、SectionLayoutEngine、PermissionManager、MenuBarMoveResult）与 StatusItemDefaults、MenuBarScanner、MenuBarItemMover、ClickForwarder
+ * [OUTPUT]: 提供 MenuBarController（管理 Ice/Hidden Bar 规范的 NSStatusItem 位序创建与启动就绪折叠、无条件清图撑开隐藏、WindowID 防自锁自愈、单图标临时借位二级栏与右键菜单）
+ * [POS]: TidyBar 核心常驻控制器，统一协调顶部状态栏折叠、二级下拉栏展示与设置页图标重排
  * [PROTOCOL]: Update this header on change, then check GEMINI.md
  */
 
@@ -32,20 +32,20 @@ final class MenuBarController: NSObject {
 
     private let settingsStore: SettingsStore
     private let onOpenSettings: (Int) -> Void
+    private let secondaryPanel = SecondaryBarPanelController()
+    private let clickForwarder = ClickForwarder()
 
     private var toggleItem: NSStatusItem!
     private var hiddenDividerItem: NSStatusItem!
     private var alwaysHiddenDividerItem: NSStatusItem?
-
-    private let secondaryPanel = SecondaryBarPanelController()
 
     private var state: ExpansionState = .collapsed
     private var lastOrderIssue: DividerOrderValidation = .valid
     private var lastAppliedSettings: TidyBarSettings
     private var isPointerHoveringPanel = false
     private var hasAttemptedPositionRepair = false
+    private var isRepairingOrder = false
 
-    // 自动收起与失焦监听仅在展开期间存在，收起后立即销毁，保证空闲 0% CPU
     private var autoRehideWorkItem: DispatchWorkItem?
     private var globalClickMonitor: Any?
     private var workspaceObserver: NSObjectProtocol?
@@ -71,9 +71,9 @@ final class MenuBarController: NSObject {
             }
         }
 
-        // 延迟 0.35s 待 macOS 完成 NSStatusItem 初始布局后校验顺序并默认折叠
+        // 等待 macOS 将所有 NSStatusItem 放置出 (0, 0) 后再校验顺序并折叠
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-            self?.collapse(force: false)
+            self?.collapseAtLaunch(retriesLeft: 12)
         }
     }
 
@@ -102,8 +102,7 @@ final class MenuBarController: NSObject {
     }
 
     func expand(includeAlwaysHidden: Bool) {
-        let settings = settingsStore.settings
-        switch settings.displayMode {
+        switch settingsStore.settings.displayMode {
         case .inline:
             expandInline(includeAlwaysHidden: includeAlwaysHidden)
         case .secondaryBar:
@@ -116,10 +115,16 @@ final class MenuBarController: NSObject {
         tearDownAutoRehideWatchers()
         isPointerHoveringPanel = false
 
+        if clickForwarder.hasTempShownItems {
+            Task { @MainActor [weak self] in
+                await self?.clickForwarder.rehideTempShownItemsNow()
+            }
+        }
+
         guard let dividers = liveDividerCGFrames() else {
             if force {
-                hiddenDividerItem.length = Constants.hiddenDividerLength
-                alwaysHiddenDividerItem?.length = Constants.alwaysHiddenDividerLength
+                setDividerCollapsed(hiddenDividerItem, collapsed: false)
+                alwaysHiddenDividerItem.map { setDividerCollapsed($0, collapsed: false) }
                 state = .collapsed
                 refreshArt()
             }
@@ -139,45 +144,32 @@ final class MenuBarController: NSObject {
         lastOrderIssue = validation
 
         guard validation == .valid && !toggleOffScreen else {
-            // 防自锁：顺序异常或主按钮已被挤出屏幕时，立即缩回分割线并触发一次性自愈重建
-            hiddenDividerItem.length = Constants.hiddenDividerLength
-            alwaysHiddenDividerItem?.length = Constants.alwaysHiddenDividerLength
+            setDividerCollapsed(hiddenDividerItem, collapsed: false)
+            alwaysHiddenDividerItem.map { setDividerCollapsed($0, collapsed: false) }
             state = .collapsed
             refreshArt()
-            if !hasAttemptedPositionRepair {
-                repairInvertedDividerPositionsIfNeeded()
+            if !hasAttemptedPositionRepair && !isRepairingOrder {
+                Task { @MainActor [weak self] in
+                    await self?.repairInvertedDividerPositions(toggleOffScreen: toggleOffScreen)
+                }
             }
             return
         }
 
-        // 只有当分区内确实存在图标时才撑开 10_000 宽度将其推离屏幕；
-        // 若分区为空，则保持紧凑可见分割线，方便用户识别边界与拖动。
-        let partitioned = SectionLayoutEngine.partitionItems(
-            MenuBarScanner.readRawStatusWindows(),
-            hiddenDividerRightX: dividers.hidden.maxX,
-            alwaysHiddenDividerRightX: dividers.always?.maxX,
-            ownPID: ProcessInfo.processInfo.processIdentifier,
-            menuBarCGMinY: ctx.cgMinY
-        )
-
-        hiddenDividerItem.length = (!partitioned.hidden.isEmpty || !partitioned.alwaysHidden.isEmpty)
-            ? Constants.collapsedSpacerLength
-            : Constants.hiddenDividerLength
-
-        alwaysHiddenDividerItem?.length = !partitioned.alwaysHidden.isEmpty
-            ? Constants.collapsedSpacerLength
-            : Constants.alwaysHiddenDividerLength
+        // 严格遵循 Ice / Hidden Bar：折叠态无条件清空分隔线图标、禁用高亮并撑开 10_000pt 推离屏幕
+        setDividerCollapsed(hiddenDividerItem, collapsed: true)
+        alwaysHiddenDividerItem.map { setDividerCollapsed($0, collapsed: true) }
 
         state = .collapsed
         refreshArt()
     }
 
-    /// 退出或关机前收缩分割线，避免 macOS 持久化 10_000 撑开状态并在下次启动引发顺序错位
+    /// 退出或关机前收缩分割线，避免 macOS 持久化 10_000 撑开状态并在下次启动引发错位
     func resetDividersToCompact() {
         secondaryPanel.hide()
         tearDownAutoRehideWatchers()
-        hiddenDividerItem.length = Constants.hiddenDividerLength
-        alwaysHiddenDividerItem?.length = Constants.alwaysHiddenDividerLength
+        setDividerCollapsed(hiddenDividerItem, collapsed: false)
+        alwaysHiddenDividerItem.map { setDividerCollapsed($0, collapsed: false) }
         state = .collapsed
         refreshArt()
     }
@@ -185,6 +177,7 @@ final class MenuBarController: NSObject {
     // MARK: - Settings Icon Manager API
 
     func scanFullSnapshot() async -> FullMenuBarSnapshot {
+        await clickForwarder.rehideTempShownItemsNow()
         let ctx = currentMenuBarContext()
 
         if let dividers = liveDividerCGFrames() {
@@ -208,6 +201,7 @@ final class MenuBarController: NSObject {
     }
 
     func moveItem(_ item: MenuBarItemInfo, to targetSection: MenuBarSection) async -> MenuBarMoveResult {
+        await clickForwarder.rehideTempShownItemsNow()
         secondaryPanel.hide()
         tearDownAutoRehideWatchers()
 
@@ -229,6 +223,7 @@ final class MenuBarController: NSObject {
     }
 
     func alignDividerNextToToggle() async -> MenuBarMoveResult {
+        await clickForwarder.rehideTempShownItemsNow()
         secondaryPanel.hide()
         tearDownAutoRehideWatchers()
 
@@ -247,14 +242,18 @@ final class MenuBarController: NSObject {
         return result
     }
 
-    // MARK: - Setup
+    // MARK: - Setup & Launch Sequence
 
     private func setupStatusItems() {
+        let alwaysEnabled = settingsStore.settings.enableAlwaysHiddenSection
+        StatusItemDefaults.sanitizeBeforeCreation(alwaysHiddenEnabled: alwaysEnabled)
+
         let statusBar = NSStatusBar.system
 
-        // 1. 严格先创建主按钮（位于最右侧）
+        // 1. 先创建主开关（autosave Preferred Position = 0，居最右）
         toggleItem = statusBar.statusItem(withLength: Constants.toggleLength)
-        toggleItem.autosaveName = "TidyBar.toggle"
+        toggleItem.autosaveName = StatusItemDefaults.AutosaveName.toggle
+        toggleItem.isVisible = true
         if let button = toggleItem.button {
             button.target = self
             button.action = #selector(handleToggleButtonAction(_:))
@@ -262,13 +261,13 @@ final class MenuBarController: NSObject {
             button.toolTip = "TidyBar · 左键展开/收起 · Option+点击显示全部 · 右键菜单"
         }
 
-        // 2. 创建普通隐藏分割线（位于主按钮左侧）
+        // 2. 再创建普通隐藏分割线（Preferred Position = 1，紧邻主开关左侧）
         hiddenDividerItem = statusBar.statusItem(withLength: Constants.hiddenDividerLength)
-        hiddenDividerItem.autosaveName = "TidyBar.hiddenDivider"
-        hiddenDividerItem.button?.toolTip = "TidyBar 隐藏分界线：左侧图标将被隐藏（也可在设置中一键选择）"
-        hiddenDividerItem.button?.isEnabled = false
+        hiddenDividerItem.autosaveName = StatusItemDefaults.AutosaveName.hiddenDivider
+        hiddenDividerItem.isVisible = true
+        hiddenDividerItem.button?.toolTip = "TidyBar 隐藏分界线：左侧图标将被隐藏"
 
-        // 3. 按配置创建「总是隐藏」分割线（位于普通隐藏分割线更左侧）
+        // 3. 按需创建「总是隐藏」分割线（Preferred Position = nil，由系统置于更左侧）
         syncAlwaysHiddenDividerItem()
         refreshArt()
     }
@@ -278,15 +277,29 @@ final class MenuBarController: NSObject {
         if enabled {
             if alwaysHiddenDividerItem == nil {
                 let item = NSStatusBar.system.statusItem(withLength: Constants.alwaysHiddenDividerLength)
-                item.autosaveName = "TidyBar.alwaysHiddenDivider"
+                item.autosaveName = StatusItemDefaults.AutosaveName.alwaysHiddenDivider
+                item.isVisible = true
                 item.button?.toolTip = "TidyBar 总是隐藏分界线：左侧仅在 Option+点击时展开"
-                item.button?.isEnabled = false
                 alwaysHiddenDividerItem = item
             }
         } else if let existing = alwaysHiddenDividerItem {
-            NSStatusBar.system.removeStatusItem(existing)
+            StatusItemDefaults.preservingPreferredPosition(for: StatusItemDefaults.AutosaveName.alwaysHiddenDivider) {
+                NSStatusBar.system.removeStatusItem(existing)
+            }
             alwaysHiddenDividerItem = nil
         }
+    }
+
+    private func collapseAtLaunch(retriesLeft: Int) {
+        let togglePlaced = toggleItem.button?.window?.frame.origin != .zero
+        let hiddenPlaced = hiddenDividerItem.button?.window?.frame.origin != .zero
+        if (!togglePlaced || !hiddenPlaced || liveDividerCGFrames() == nil), retriesLeft > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                self?.collapseAtLaunch(retriesLeft: retriesLeft - 1)
+            }
+            return
+        }
+        collapse(force: false)
     }
 
     private func wireSecondaryPanelCallbacks() {
@@ -325,12 +338,15 @@ final class MenuBarController: NSObject {
 
     private func expandInline(includeAlwaysHidden: Bool) {
         secondaryPanel.hide()
-        hiddenDividerItem.length = Constants.hiddenDividerLength
+        if clickForwarder.hasTempShownItems {
+            Task { @MainActor [weak self] in
+                await self?.clickForwarder.rehideTempShownItemsNow()
+            }
+        }
 
+        setDividerCollapsed(hiddenDividerItem, collapsed: false)
         let showAlways = includeAlwaysHidden && settingsStore.settings.enableAlwaysHiddenSection
-        alwaysHiddenDividerItem?.length = showAlways
-            ? Constants.alwaysHiddenDividerLength
-            : Constants.collapsedSpacerLength
+        alwaysHiddenDividerItem.map { setDividerCollapsed($0, collapsed: !showAlways) }
 
         state = showAlways ? .inlineAll : .inlineHiddenOnly
         lastOrderIssue = .valid
@@ -357,16 +373,13 @@ final class MenuBarController: NSObject {
         }
 
         let showAlways = includeAlwaysHidden && settingsStore.settings.enableAlwaysHiddenSection
-        let hiddenRightX = dividers.hidden.maxX
-        let alwaysRightX = dividers.always?.maxX
         let maxColumns = settingsStore.settings.secondaryBarMaxColumns
         let menuBarCGMinY = currentMenuBarContext().cgMinY
 
-        // 纯同步扫描并即时弹出二级下拉栏，确保单击第一下零延迟响应
         let result = MenuBarScanner.scanHiddenSync(
             menuBarCGMinY: menuBarCGMinY,
-            hiddenDividerRightX: hiddenRightX,
-            alwaysHiddenDividerRightX: alwaysRightX,
+            hiddenDividerRightX: dividers.hidden.maxX,
+            alwaysHiddenDividerRightX: dividers.always?.maxX,
             includeAlwaysHidden: showAlways
         )
         secondaryPanel.show(
@@ -384,19 +397,29 @@ final class MenuBarController: NSObject {
         secondaryPanel.hide()
         tearDownAutoRehideWatchers()
 
+        guard let snaps = liveDividerSnapshots() else {
+            collapse(force: true)
+            return
+        }
+
         let ctx = currentMenuBarContext()
-        let outcome = await ClickForwarder.forwardClick(
+        let outcome = await clickForwarder.forwardClick(
             to: info,
             isRightClick: isRightClick,
             menuBarCGMinY: ctx.cgMinY,
             screenCGFrame: ctx.screenCGFrame,
             auxiliaryTopLeft: ctx.auxiliaryTopLeft,
             auxiliaryTopRight: ctx.auxiliaryTopRight,
+            toggleWindowID: snaps.toggle.windowID,
+            toggleCGFrame: snaps.toggle.cgFrame,
+            hiddenDividerWindowID: snaps.hidden.windowID,
+            hiddenDividerCGFrame: snaps.hidden.cgFrame,
+            alwaysHiddenDividerWindowID: snaps.always?.windowID,
             temporarilyReveal: { [weak self] section in
                 guard let self else { return }
-                self.hiddenDividerItem.length = Constants.hiddenDividerLength
+                self.setDividerCollapsed(self.hiddenDividerItem, collapsed: false)
                 if section == .alwaysHidden {
-                    self.alwaysHiddenDividerItem?.length = Constants.alwaysHiddenDividerLength
+                    self.alwaysHiddenDividerItem.map { self.setDividerCollapsed($0, collapsed: false) }
                     self.state = .inlineAll
                 } else {
                     self.state = .inlineHiddenOnly
@@ -406,7 +429,11 @@ final class MenuBarController: NSObject {
         )
 
         switch outcome {
-        case .forwarded:
+        case .forwardedViaTempShow:
+            // 单图标临时借位期间不碰全部分割线，由 ClickForwarder 监测弹窗关闭后静默归位
+            state = .collapsed
+            refreshArt()
+        case .forwardedViaReveal:
             armPostClickAutoRehideWatchers(clickedPID: info.ownerPID)
         case .missingAccessibilityPermission:
             collapse(force: true)
@@ -423,8 +450,6 @@ final class MenuBarController: NSObject {
             toggle(includeAlwaysHidden: false)
             return
         }
-
-        // 按住 Command 键时保留给 macOS 原生菜单栏拖动排序
         if event.modifierFlags.contains(.command) {
             return
         }
@@ -432,8 +457,7 @@ final class MenuBarController: NSObject {
         if event.type == .rightMouseDown || event.type == .rightMouseUp || event.modifierFlags.contains(.control) {
             showContextMenu()
         } else {
-            let includeAlways = event.modifierFlags.contains(.option)
-            toggle(includeAlwaysHidden: includeAlways)
+            toggle(includeAlwaysHidden: event.modifierFlags.contains(.option))
         }
     }
 
@@ -482,8 +506,7 @@ final class MenuBarController: NSObject {
 
         menu.addItem(.separator())
 
-        let isCollapsed = state == .collapsed
-        let toggleTitle = isCollapsed
+        let toggleTitle = state == .collapsed
             ? "展开隐藏区 (\(settings.toggleHotkey.displayString))"
             : "收起隐藏区 (\(settings.toggleHotkey.displayString))"
         let toggleMenuItem = NSMenuItem(title: toggleTitle, action: #selector(menuToggleHidden), keyEquivalent: "")
@@ -541,14 +564,12 @@ final class MenuBarController: NSObject {
         quitItem.target = self
         menu.addItem(quitItem)
 
-        toggleItem.menu = menu
-        toggleItem.button?.performClick(nil)
-        toggleItem.menu = nil
+        if let button = toggleItem.button {
+            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: 0), in: button)
+        }
     }
 
-    @objc private func menuManageIcons() {
-        onOpenSettings(0)
-    }
+    @objc private func menuManageIcons() { onOpenSettings(0) }
 
     @objc private func menuAlignDivider() {
         Task { @MainActor in
@@ -559,13 +580,8 @@ final class MenuBarController: NSObject {
         }
     }
 
-    @objc private func menuToggleHidden() {
-        toggle(includeAlwaysHidden: false)
-    }
-
-    @objc private func menuShowAll() {
-        expand(includeAlwaysHidden: true)
-    }
+    @objc private func menuToggleHidden() { toggle(includeAlwaysHidden: false) }
+    @objc private func menuShowAll() { expand(includeAlwaysHidden: true) }
 
     @objc private func menuSelectDisplayMode(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String,
@@ -582,13 +598,8 @@ final class MenuBarController: NSObject {
         settingsStore.update { $0.enableAlwaysHiddenSection.toggle() }
     }
 
-    @objc private func menuOpenSettings() {
-        onOpenSettings(1)
-    }
-
-    @objc private func menuQuit() {
-        NSApp.terminate(nil)
-    }
+    @objc private func menuOpenSettings() { onOpenSettings(1) }
+    @objc private func menuQuit() { NSApp.terminate(nil) }
 
     // MARK: - Auto Rehide & Monitors (Zero Idle Overhead)
 
@@ -632,7 +643,6 @@ final class MenuBarController: NSObject {
         }
     }
 
-    /// 二级栏点击转发后的专属收起监控：延迟挂接、监听 mouseUp、忽略目标进程激活与窗口内点击
     private func armPostClickAutoRehideWatchers(clickedPID: pid_t) {
         tearDownAutoRehideWatchers()
         scheduleAutoRehideTimerIfNeeded()
@@ -640,7 +650,6 @@ final class MenuBarController: NSObject {
         let settings = settingsStore.settings
         let installTime = Date()
 
-        // 延迟 350ms 后挂接全局点击监听，防止误捕自身刚投递的 CGEvent 点击
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
             guard let self, self.state != .collapsed else { return }
             self.globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp, .rightMouseUp]) { [weak self] _ in
@@ -656,7 +665,6 @@ final class MenuBarController: NSObject {
                     if self.isPointInsideProcessWindow(mouseLoc: mouseLoc, pid: clickedPID) {
                         return
                     }
-                    // 延迟 220ms 再折叠，让目标应用的菜单项回调有充裕时间触发
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { [weak self] in
                         guard let self, self.state != .collapsed else { return }
                         self.collapse(force: true)
@@ -736,11 +744,24 @@ final class MenuBarController: NSObject {
         }
     }
 
-    // MARK: - Coordinate & Divider Helpers
+    // MARK: - Divider Helpers, Art & Self-Healing
+
+    private func setDividerCollapsed(_ item: NSStatusItem, collapsed: Bool) {
+        let isAlways = (item === alwaysHiddenDividerItem)
+        let compactLength = isAlways ? Constants.alwaysHiddenDividerLength : Constants.hiddenDividerLength
+        item.length = collapsed ? Constants.collapsedSpacerLength : compactLength
+        item.button?.cell?.isEnabled = !collapsed
+        if collapsed {
+            item.button?.isHighlighted = false
+            item.button?.image = nil
+        }
+    }
 
     private func prepareDividersForRearrangement() {
         hiddenDividerItem.length = Constants.arrangeDividerLength
+        hiddenDividerItem.button?.cell?.isEnabled = true
         alwaysHiddenDividerItem?.length = Constants.arrangeDividerLength
+        alwaysHiddenDividerItem?.button?.cell?.isEnabled = true
         refreshArt()
     }
 
@@ -757,31 +778,42 @@ final class MenuBarController: NSObject {
             refreshArt()
             collapse(force: state != .collapsed)
         } else if prev.toggleIconStyle != next.toggleIconStyle || prev.dividerStyle != next.dividerStyle {
-            // 仅切换图标或分割线样式时直接重绘模板图，避免无意义的窗口扫描与重排
             refreshArt()
         }
     }
 
     private func refreshArt() {
         let settings = settingsStore.settings
-        let isExpanded = state != .collapsed
         toggleItem.button?.image = StatusItemArt.toggleImage(
             style: settings.toggleIconStyle,
-            isExpanded: isExpanded
+            isExpanded: state != .collapsed
         )
-        hiddenDividerItem.button?.image = StatusItemArt.dividerImage(
-            style: settings.dividerStyle,
-            isAlwaysHidden: false
-        )
-        alwaysHiddenDividerItem?.button?.image = StatusItemArt.dividerImage(
-            style: settings.dividerStyle,
-            isAlwaysHidden: true
-        )
+
+        if hiddenDividerItem.length < 500 {
+            hiddenDividerItem.button?.image = StatusItemArt.dividerImage(
+                style: settings.dividerStyle,
+                isAlwaysHidden: false
+            )
+        } else {
+            hiddenDividerItem.button?.image = nil
+            hiddenDividerItem.button?.isHighlighted = false
+        }
+
+        if let always = alwaysHiddenDividerItem {
+            if always.length < 500 {
+                always.button?.image = StatusItemArt.dividerImage(
+                    style: settings.dividerStyle,
+                    isAlwaysHidden: true
+                )
+            } else {
+                always.button?.image = nil
+                always.button?.isHighlighted = false
+            }
+        }
     }
 
     private func statusItemScreenFrame(_ item: NSStatusItem) -> CGRect? {
-        guard let button = item.button, let window = button.window else { return nil }
-        return window.frame
+        item.button?.window?.frame
     }
 
     private func currentMenuBarContext() -> (
@@ -834,7 +866,6 @@ final class MenuBarController: NSObject {
             return (toggleWin, hiddenWin, alwaysWin)
         }
 
-        // 副屏菜单栏等场景回退使用 AppKit frame 转 CG 坐标，同时保留真实 windowID 绝不互换身份
         guard let toggleAppKit = statusItemScreenFrame(toggleItem),
               let hiddenAppKit = statusItemScreenFrame(hiddenDividerItem) else {
             return nil
@@ -874,43 +905,49 @@ final class MenuBarController: NSObject {
         return CGWindowID(num)
     }
 
-    private func repairInvertedDividerPositionsIfNeeded() {
+    private func repairInvertedDividerPositions(toggleOffScreen: Bool) async {
         hasAttemptedPositionRepair = true
+        isRepairingOrder = true
+        defer { isRepairingOrder = false }
 
-        // 1. 移除可能被 macOS 恢复到主按钮右侧或把主按钮挤出屏幕的旧分割线
-        NSStatusBar.system.removeStatusItem(hiddenDividerItem)
-        if let existingAlways = alwaysHiddenDividerItem {
-            NSStatusBar.system.removeStatusItem(existingAlways)
+        // 1. 若具备辅助功能权限且主按钮仍在屏幕内，优先尝试程序化拖拽纠偏
+        if PermissionManager.hasAccessibilityPermission,
+           !toggleOffScreen,
+           let snaps = liveDividerSnapshots() {
+            let enforced = await MenuBarItemMover.enforceDividerOrder(
+                toggleWindowID: snaps.toggle.windowID,
+                hiddenWindowID: snaps.hidden.windowID,
+                alwaysWindowID: snaps.always?.windowID,
+                ownPID: ProcessInfo.processInfo.processIdentifier
+            )
+            if enforced {
+                try? await Task.sleep(for: .milliseconds(80))
+                if let latest = liveDividerCGFrames(),
+                   SectionLayoutEngine.validateDividerOrder(
+                    toggleFrame: latest.toggle,
+                    hiddenDividerFrame: latest.hidden,
+                    alwaysHiddenDividerFrame: latest.always
+                   ) == .valid {
+                    collapse(force: false)
+                    return
+                }
+            }
+        }
+
+        // 2. 全量原子重建：移除全部 NSStatusItem（含主按钮），清空持久化位置并按严格顺序重建
+        let statusBar = NSStatusBar.system
+        if let always = alwaysHiddenDividerItem {
+            statusBar.removeStatusItem(always)
             alwaysHiddenDividerItem = nil
         }
+        statusBar.removeStatusItem(hiddenDividerItem)
+        statusBar.removeStatusItem(toggleItem)
 
-        // 2. 修复 UserDefaults 中保存的异常 Preferred Position（保证 hidden 在 toggle 左侧）
-        let defaults = UserDefaults.standard
-        let toggleKey = "NSStatusItem Preferred Position TidyBar.toggle"
-        let hiddenKey = "NSStatusItem Preferred Position TidyBar.hiddenDivider"
-        let alwaysKey = "NSStatusItem Preferred Position TidyBar.alwaysHiddenDivider"
+        StatusItemDefaults.resetToCleanOrder()
+        setupStatusItems()
 
-        if let togglePos = defaults.object(forKey: toggleKey) as? Double, togglePos > 0, togglePos < 1600 {
-            defaults.set(togglePos + 32, forKey: hiddenKey)
-            defaults.set(togglePos + 56, forKey: alwaysKey)
-        } else {
-            defaults.removeObject(forKey: toggleKey)
-            defaults.removeObject(forKey: hiddenKey)
-            defaults.removeObject(forKey: alwaysKey)
-        }
-
-        // 3. 按 toggle -> hiddenDivider -> alwaysHiddenDivider 顺序重建分割线（严格落于主开关左侧）
-        let rebuiltHidden = NSStatusBar.system.statusItem(withLength: Constants.hiddenDividerLength)
-        rebuiltHidden.autosaveName = "TidyBar.hiddenDivider"
-        rebuiltHidden.button?.toolTip = "TidyBar 隐藏分界线：左侧图标将被隐藏（也可在设置中一键选择）"
-        rebuiltHidden.button?.isEnabled = false
-        hiddenDividerItem = rebuiltHidden
-
-        syncAlwaysHiddenDividerItem()
-        refreshArt()
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-            self?.collapse(force: false)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.collapseAtLaunch(retriesLeft: 10)
         }
     }
 

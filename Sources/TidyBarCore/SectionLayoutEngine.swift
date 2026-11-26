@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 CoreGraphics、Foundation 与 Models（MenuBarItemInfo、MenuBarSection）
- * [OUTPUT]: 提供 SectionLayoutEngine 几何引擎（防自锁顺序校验、按 WindowID 识别自身窗口与出屏硬守卫、三段式分区、二级下拉栏定位、刘海盲区判定）
+ * [OUTPUT]: 提供 SectionLayoutEngine 几何引擎（Preferred Position 预设位序校验、防自锁顺序校验、按 WindowID 识别自身窗口与出屏硬守卫、三段式分区、临时借位锚点选择、二级下拉栏定位、刘海盲区判定）
  * [POS]: TidyBarCore 的纯几何算法中枢，所有状态栏边界计算与防自锁不变量均在此集中验证
  * [PROTOCOL]: Update this header on change, then check GEMINI.md
  */
@@ -64,6 +64,27 @@ public struct PartitionedMenuBarItems: Equatable, Sendable {
 // ============================================================================
 
 public enum SectionLayoutEngine {
+    /// 校验 UserDefaults 中 macOS 持久化的 NSStatusItem Preferred Position 是否满足安全有序：
+    /// 注意 macOS 从屏幕右缘向左计数（数值越小越靠右），必须满足 0 <= toggle < hidden (< always)。
+    public static func arePreferredPositionsOrdered(
+        togglePos: Double?,
+        hiddenPos: Double?,
+        alwaysPos: Double?,
+        minGap: Double = 0.5
+    ) -> Bool {
+        guard let togglePos, let hiddenPos else { return false }
+        guard togglePos >= 0, togglePos < 2000 else { return false }
+        guard hiddenPos >= 0, hiddenPos < 3000 else { return false }
+        guard hiddenPos >= togglePos + minGap else { return false }
+
+        if let alwaysPos {
+            guard alwaysPos >= hiddenPos + minGap, alwaysPos < 5000 else {
+                return false
+            }
+        }
+        return true
+    }
+
     /// 校验主开关与分割线水平顺序：[总是隐藏分割线] <= [隐藏分割线] <= [主按钮]
     /// 折叠前必须通过此校验，否则撑开分割线会把主按钮本身推出屏幕导致无法点击。
     public static func validateDividerOrder(
@@ -245,24 +266,53 @@ public enum SectionLayoutEngine {
             .sorted { $0.cgFrame.minX < $1.cgFrame.minX }
     }
 
-    /// 判断是否为系统强制钉在最右侧不可通过 Command+Drag 移走的固定项（例如控制中心主体或贴右缘时钟）
+    /// 判断是否为系统强制钉在最右侧不可通过 Command+Drag 移走或隐藏的固定项（时钟、控制中心主体、Siri、屏幕录制指示等）
     public static func isLikelySystemPinnedItem(
         ownerName: String,
         title: String,
         cgFrame: CGRect,
         screenMaxX: CGFloat
     ) -> Bool {
-        let isControlCenter = ownerName == "控制中心" || ownerName == "ControlCenter" || ownerName == "Control Center"
+        let trimmedOwner = ownerName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowerTitle = title.lowercased()
+
+        if trimmedOwner == "Siri" || (trimmedOwner.contains("SystemUIServer") && lowerTitle == "siri") {
+            return true
+        }
+
+        let isControlCenter = trimmedOwner == "控制中心"
+            || trimmedOwner == "ControlCenter"
+            || trimmedOwner == "Control Center"
         guard isControlCenter else { return false }
 
         if screenMaxX - cgFrame.maxX < 8 {
             return true
         }
-        let lowerTitle = title.lowercased()
-        if lowerTitle.contains("clock") || lowerTitle.contains("bentobox") || title.contains("时钟") {
+        let pinnedKeywords = [
+            "clock", "bentobox", "时钟",
+            "audiovideomodule", "facetime", "musicrecognition"
+        ]
+        if pinnedKeywords.contains(where: { lowerTitle.contains($0) }) {
             return true
         }
         return false
+    }
+
+    /// 为单图标临时借位选出最左侧且左侧空间足够（不会撞入刘海或应用菜单）的可见锚点窗口
+    public static func chooseTempShowAnchor(
+        visibleItems: [RawStatusWindow],
+        toggleCGFrame: CGRect,
+        toggleWindowID: CGWindowID,
+        itemWidth: CGFloat,
+        minSafeX: CGFloat
+    ) -> CGWindowID? {
+        var candidates: [(windowID: CGWindowID, minX: CGFloat)] = visibleItems
+            .filter { $0.isOnScreen && $0.cgFrame.minX >= toggleCGFrame.minX - 2 }
+            .map { ($0.windowID, $0.cgFrame.minX) }
+        candidates.append((toggleWindowID, toggleCGFrame.minX))
+        candidates.sort { $0.minX < $1.minX }
+
+        return candidates.first { $0.minX - itemWidth >= minSafeX }?.windowID
     }
 
     /// 计算二级下拉栏在 AppKit 坐标系下的窗口矩形（自动居中对齐并严格钳制在屏幕可见区内）

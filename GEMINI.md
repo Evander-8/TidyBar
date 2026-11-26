@@ -3,7 +3,7 @@ Swift 5.10 + macOS 14.0+ + AppKit + SwiftUI（按需懒加载）+ Carbon + Servi
 
 <directory>
 Sources/TidyBarCore/ - 无界面核心业务逻辑层（数据模型、配置持久化、三段式分区与几何引擎、全局热键、开机自启、系统权限管理）
-Sources/TidyBar/ - 纯 AppKit 常驻菜单栏壳、菜单栏抓图扫描器、事件点击转发器、二级下拉栏面板与懒加载 SwiftUI 设置窗口
+Sources/TidyBar/ - 纯 AppKit 常驻菜单栏壳、位序持久化守卫、双 EventTap 移动与单图标借位点击转发引擎、二级下拉栏面板与懒加载 SwiftUI 设置窗口
 Resources/ - 应用 Bundle 元数据（Info.plist）与高清图标资源（AppIcon.icns）
 Tests/TidyBarTests/ - TidyBarCore 布局引擎、配置存储与热键格式化单元测试
 scripts/ - 矢量图标生成、Release 编译签名（.app）与磁盘镜像打包（.dmg）脚本

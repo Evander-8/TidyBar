@@ -446,4 +446,96 @@ final class TidyBarCoreTests: XCTestCase {
         XCTAssertEqual(thirdParty.displayLabel, "微信")
         XCTAssertNil(MenuBarItemInfo.suggestedSystemSymbolName(ownerName: thirdParty.ownerName, title: thirdParty.title))
     }
+
+    func testArePreferredPositionsOrderedValidatesRightToLeftInvariant() {
+        // 合法位序：0 (toggle) < 1 (hidden) < 120 (always)
+        XCTAssertTrue(SectionLayoutEngine.arePreferredPositionsOrdered(
+            togglePos: 0,
+            hiddenPos: 1,
+            alwaysPos: nil
+        ))
+        XCTAssertTrue(SectionLayoutEngine.arePreferredPositionsOrdered(
+            togglePos: 450,
+            hiddenPos: 490,
+            alwaysPos: 610
+        ))
+
+        // 真实故障现场：hidden=456 < toggle=488（hidden 跑到 toggle 右侧）
+        XCTAssertFalse(SectionLayoutEngine.arePreferredPositionsOrdered(
+            togglePos: 488,
+            hiddenPos: 456,
+            alwaysPos: 610
+        ))
+
+        // 缺失或越界污染值
+        XCTAssertFalse(SectionLayoutEngine.arePreferredPositionsOrdered(
+            togglePos: nil,
+            hiddenPos: 1,
+            alwaysPos: nil
+        ))
+        XCTAssertFalse(SectionLayoutEngine.arePreferredPositionsOrdered(
+            togglePos: 3200,
+            hiddenPos: 3300,
+            alwaysPos: nil
+        ))
+        XCTAssertFalse(SectionLayoutEngine.arePreferredPositionsOrdered(
+            togglePos: 10,
+            hiddenPos: 30,
+            alwaysPos: 20
+        ))
+    }
+
+    func testChooseTempShowAnchorAndExtendedPinnedItems() {
+        let toggle = CGRect(x: 1280, y: 0, width: 40, height: 43)
+        let visibleItems: [RawStatusWindow] = [
+            RawStatusWindow(windowID: 101, ownerPID: 10, ownerName: "NearNotch", title: "", cgFrame: CGRect(x: 1030, y: 0, width: 28, height: 43), isOnScreen: true),
+            RawStatusWindow(windowID: 102, ownerPID: 11, ownerName: "QuickSnap", title: "", cgFrame: CGRect(x: 1340, y: 0, width: 32, height: 43), isOnScreen: true),
+            RawStatusWindow(windowID: 103, ownerPID: 12, ownerName: "WeChat", title: "", cgFrame: CGRect(x: 1400, y: 0, width: 40, height: 43), isOnScreen: true)
+        ]
+
+        // NearNotch (1030 - 30 = 1000 < 1025) 被跳过，选中最左可用锚点 toggle (1280)
+        let anchor = SectionLayoutEngine.chooseTempShowAnchor(
+            visibleItems: visibleItems,
+            toggleCGFrame: toggle,
+            toggleWindowID: 999,
+            itemWidth: 30,
+            minSafeX: 1025
+        )
+        XCTAssertEqual(anchor, 999)
+
+        // 当刘海/应用菜单边界推到 1320 时，toggle (1280) 也被跳过，落到 QuickSnap (1340 - 30 = 1310 < 1320? 跳过) -> WeChat (1400)
+        let tightAnchor = SectionLayoutEngine.chooseTempShowAnchor(
+            visibleItems: visibleItems,
+            toggleCGFrame: toggle,
+            toggleWindowID: 999,
+            itemWidth: 30,
+            minSafeX: 1320
+        )
+        XCTAssertEqual(tightAnchor, 103)
+
+        // 无足够空间时返回 nil（触发降级整段显露）
+        XCTAssertNil(
+            SectionLayoutEngine.chooseTempShowAnchor(
+                visibleItems: visibleItems,
+                toggleCGFrame: toggle,
+                toggleWindowID: 999,
+                itemWidth: 30,
+                minSafeX: 1390
+            )
+        )
+
+        // Siri 与音视频录制模块不可隐藏
+        XCTAssertTrue(SectionLayoutEngine.isLikelySystemPinnedItem(
+            ownerName: "Siri",
+            title: "Siri",
+            cgFrame: CGRect(x: 1700, y: 0, width: 28, height: 43),
+            screenMaxX: 1800
+        ))
+        XCTAssertTrue(SectionLayoutEngine.isLikelySystemPinnedItem(
+            ownerName: "ControlCenter",
+            title: "AudioVideoModule",
+            cgFrame: CGRect(x: 1500, y: 0, width: 28, height: 43),
+            screenMaxX: 1800
+        ))
+    }
 }
