@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 AppKit、CoreGraphics 与 TidyBarCore（MenuBarItemInfo、SectionLayoutEngine）
- * [OUTPUT]: 提供 CapturedMenuBarItem、MenuBarScanResult、FullMenuBarSnapshot 与同步毫秒级 MenuBarScanner
- * [POS]: TidyBar 的菜单栏图标探测引擎，纯 CGWindowList + 进程图标解析，零异步阻塞与零录屏弹窗
+ * [OUTPUT]: 提供 CapturedMenuBarItem、MenuBarScanResult、FullMenuBarSnapshot 与同步毫秒级 MenuBarScanner（附带 bundleIdentifier 解析）
+ * [POS]: TidyBar 的菜单栏图标探测引擎，纯 CGWindowList + 进程信息/图标解析，零异步阻塞与零录屏弹窗
  * [PROTOCOL]: Update this header on change, then check GEMINI.md
  */
 
@@ -56,9 +56,12 @@ enum MenuBarScanner {
             menuBarCGMinY: menuBarCGMinY
         )
 
-        let hiddenCaptured = partitioned.hidden.map { makeCapturedItem(info: $0) }
+        var bundleCache: [pid_t: String] = [:]
+        let hiddenCaptured = enrichWithBundleIdentifiers(partitioned.hidden, cache: &bundleCache)
+            .map { makeCapturedItem(info: $0) }
         let alwaysCaptured = includeAlwaysHidden
-            ? partitioned.alwaysHidden.map { makeCapturedItem(info: $0) }
+            ? enrichWithBundleIdentifiers(partitioned.alwaysHidden, cache: &bundleCache)
+                .map { makeCapturedItem(info: $0) }
             : []
 
         return MenuBarScanResult(
@@ -67,7 +70,7 @@ enum MenuBarScanner {
         )
     }
 
-    /// 扫描并归类当前屏幕全部三段式菜单栏图标（供「图标管理」页即时加载）
+    /// 扫描并归类当前屏幕全部三段式菜单栏图标（供「图标管理」页与自动归位器使用）
     static func scanAllSections(
         menuBarCGMinY: CGFloat,
         screenMaxX: CGFloat,
@@ -94,14 +97,46 @@ enum MenuBarScanner {
             ownPID: ownPID
         )
 
+        var bundleCache: [pid_t: String] = [:]
         return FullMenuBarSnapshot(
-            visibleItems: partitioned.visible.map { makeCapturedItem(info: $0) },
-            hiddenItems: partitioned.hidden.map { makeCapturedItem(info: $0) },
-            alwaysHiddenItems: partitioned.alwaysHidden.map { makeCapturedItem(info: $0) },
+            visibleItems: enrichWithBundleIdentifiers(partitioned.visible, cache: &bundleCache)
+                .map { makeCapturedItem(info: $0) },
+            hiddenItems: enrichWithBundleIdentifiers(partitioned.hidden, cache: &bundleCache)
+                .map { makeCapturedItem(info: $0) },
+            alwaysHiddenItems: enrichWithBundleIdentifiers(partitioned.alwaysHidden, cache: &bundleCache)
+                .map { makeCapturedItem(info: $0) },
             driftedBetweenCount: between.count,
             menuBarCGMinY: menuBarCGMinY,
             screenMaxX: screenMaxX
         )
+    }
+
+    static func enrichWithBundleIdentifiers(
+        _ items: [MenuBarItemInfo],
+        cache: inout [pid_t: String]
+    ) -> [MenuBarItemInfo] {
+        items.map { info in
+            let resolvedBundleID: String?
+            if let existing = info.bundleIdentifier {
+                resolvedBundleID = existing
+            } else if let cached = cache[info.ownerPID] {
+                resolvedBundleID = cached.isEmpty ? nil : cached
+            } else {
+                let id = NSRunningApplication(processIdentifier: info.ownerPID)?.bundleIdentifier ?? ""
+                cache[info.ownerPID] = id
+                resolvedBundleID = id.isEmpty ? nil : id
+            }
+            return MenuBarItemInfo(
+                windowID: info.windowID,
+                ownerPID: info.ownerPID,
+                ownerName: info.ownerName,
+                bundleIdentifier: resolvedBundleID,
+                title: info.title,
+                cgFrame: info.cgFrame,
+                section: info.section,
+                isOnScreen: info.isOnScreen
+            )
+        }
     }
 
     static func readRawStatusWindows() -> [RawStatusWindow] {

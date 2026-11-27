@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 CoreGraphics、Foundation 与 Models（MenuBarItemInfo、MenuBarSection）
- * [OUTPUT]: 提供 SectionLayoutEngine 几何引擎（Preferred Position 预设位序校验、防自锁顺序校验、按 WindowID 识别自身窗口与出屏硬守卫、三段式分区、临时借位锚点选择、二级下拉栏定位、刘海盲区判定）
+ * [OUTPUT]: 提供 SectionLayoutEngine 几何引擎（Preferred Position 位序校验（含折叠态 10_000pt 偏移）、防自锁顺序校验、按 WindowID 识别自身窗口、三段式分区、漂移规则计算 computeDriftedItems、临时借位锚点选择、二级下拉栏定位、系统固定项与刘海盲区判定）
  * [POS]: TidyBarCore 的纯几何算法中枢，所有状态栏边界计算与防自锁不变量均在此集中验证
  * [PROTOCOL]: Update this header on change, then check GEMINI.md
  */
@@ -66,6 +66,7 @@ public struct PartitionedMenuBarItems: Equatable, Sendable {
 public enum SectionLayoutEngine {
     /// 校验 UserDefaults 中 macOS 持久化的 NSStatusItem Preferred Position 是否满足安全有序：
     /// 注意 macOS 从屏幕右缘向左计数（数值越小越靠右），必须满足 0 <= toggle < hidden (< always)。
+    /// 折叠态下 hiddenDivider 会撑开 5016~10000pt，macOS 会将 alwaysHiddenDivider 存入 ~5800~12000 区间，必须放行。
     public static func arePreferredPositionsOrdered(
         togglePos: Double?,
         hiddenPos: Double?,
@@ -73,12 +74,12 @@ public enum SectionLayoutEngine {
         minGap: Double = 0.5
     ) -> Bool {
         guard let togglePos, let hiddenPos else { return false }
-        guard togglePos >= 0, togglePos < 2000 else { return false }
-        guard hiddenPos >= 0, hiddenPos < 3000 else { return false }
+        guard togglePos >= 0, togglePos < 2500 else { return false }
+        guard hiddenPos >= 0, hiddenPos < 3500 else { return false }
         guard hiddenPos >= togglePos + minGap else { return false }
 
         if let alwaysPos {
-            guard alwaysPos >= hiddenPos + minGap, alwaysPos < 5000 else {
+            guard alwaysPos >= hiddenPos + minGap, alwaysPos < 25_000 else {
                 return false
             }
         }
@@ -296,6 +297,51 @@ public enum SectionLayoutEngine {
             return true
         }
         return false
+    }
+
+    /// 根据已记忆的分区规则筛选出当前实际落位与期望分区不一致且可移动的图标列表（按先移回常显、再隐藏、最后总是隐藏排序）
+    public static func computeDriftedItems(
+        items: [MenuBarItemInfo],
+        pinnedSections: [String: MenuBarSection],
+        enableAlwaysHiddenSection: Bool,
+        screenMaxX: CGFloat
+    ) -> [(item: MenuBarItemInfo, targetSection: MenuBarSection)] {
+        guard !pinnedSections.isEmpty else { return [] }
+
+        var drifted: [(item: MenuBarItemInfo, targetSection: MenuBarSection)] = []
+        for item in items {
+            if isLikelySystemPinnedItem(
+                ownerName: item.ownerName,
+                title: item.title,
+                cgFrame: item.cgFrame,
+                screenMaxX: screenMaxX
+            ) {
+                continue
+            }
+            guard let desired = pinnedSections[item.stableKey] else { continue }
+            let effectiveTarget: MenuBarSection = (desired == .alwaysHidden && !enableAlwaysHiddenSection)
+                ? .hidden
+                : desired
+            if item.section != effectiveTarget {
+                drifted.append((item, effectiveTarget))
+            }
+        }
+
+        func priority(_ section: MenuBarSection) -> Int {
+            switch section {
+            case .visible: return 0
+            case .hidden: return 1
+            case .alwaysHidden: return 2
+            }
+        }
+
+        drifted.sort { lhs, rhs in
+            let lp = priority(lhs.targetSection)
+            let rp = priority(rhs.targetSection)
+            if lp != rp { return lp < rp }
+            return lhs.item.cgFrame.minX < rhs.item.cgFrame.minX
+        }
+        return drifted
     }
 
     /// 为单图标临时借位选出最左侧且左侧空间足够（不会撞入刘海或应用菜单）的可见锚点窗口

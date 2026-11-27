@@ -62,6 +62,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     return .failed("菜单栏控制器不可用")
                 }
                 return await mbController.alignDividerNextToToggle()
+            },
+            saveCurrentLayout: { [weak mbController] in
+                guard let mbController else { return 0 }
+                return await mbController.saveCurrentLayoutRules()
             }
         )
 

@@ -1,7 +1,7 @@
 /**
  * [INPUT]: 依赖 Foundation、AppKit（NSEvent.ModifierFlags）、Carbon（修饰键常量）、CoreGraphics（CGRect/CGWindowID）
- * [OUTPUT]: 提供 DisplayMode、ToggleIconStyle、DividerStyle、AutoRehideDelay、MenuBarSection、HotkeyCombo、MenuBarItemInfo（含系统内置项中文名称与 SF Symbol 映射）与 TidyBarSettings
- * [POS]: TidyBarCore 的核心领域模型层，为配置存储、布局引擎、扫描器与界面层提供统一契约
+ * [OUTPUT]: 提供 DisplayMode、ToggleIconStyle、DividerStyle、AutoRehideDelay、MenuBarSection、HotkeyCombo、MenuBarItemInfo（含稳定持久化标识 stableKey、系统内置项中文名称与 SF Symbol 映射）与 TidyBarSettings（含 pinnedSections 分区记忆）
+ * [POS]: TidyBarCore 的核心领域模型层，为配置存储、布局引擎、扫描器、自动归位器与界面层提供统一契约
  * [PROTOCOL]: Update this header on change, then check GEMINI.md
  */
 
@@ -103,6 +103,7 @@ public struct MenuBarItemInfo: Equatable, Sendable {
     public let windowID: CGWindowID
     public let ownerPID: pid_t
     public let ownerName: String
+    public let bundleIdentifier: String?
     public let title: String
     public let cgFrame: CGRect
     public let section: MenuBarSection
@@ -112,6 +113,7 @@ public struct MenuBarItemInfo: Equatable, Sendable {
         windowID: CGWindowID,
         ownerPID: pid_t,
         ownerName: String,
+        bundleIdentifier: String? = nil,
         title: String,
         cgFrame: CGRect,
         section: MenuBarSection,
@@ -120,10 +122,32 @@ public struct MenuBarItemInfo: Equatable, Sendable {
         self.windowID = windowID
         self.ownerPID = ownerPID
         self.ownerName = ownerName
+        self.bundleIdentifier = bundleIdentifier
         self.title = title
         self.cgFrame = cgFrame
         self.section = section
         self.isOnScreen = isOnScreen
+    }
+
+    /// 生成跨进程重启保持稳定的持久化主键（优先 bundleIdentifier，系统控制中心等按 title 区分模块）
+    public static func makeStableKey(
+        bundleIdentifier: String?,
+        ownerName: String,
+        title: String
+    ) -> String {
+        let trimmedBundle = bundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let namespace = (trimmedBundle?.isEmpty == false ? trimmedBundle : nil)
+            ?? ownerName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleanTitle.isEmpty ? namespace : "\(namespace)::\(cleanTitle)"
+    }
+
+    public var stableKey: String {
+        Self.makeStableKey(
+            bundleIdentifier: bundleIdentifier,
+            ownerName: ownerName,
+            title: title
+        )
     }
 
     public var displayLabel: String {
@@ -341,6 +365,7 @@ public struct TidyBarSettings: Codable, Equatable, Sendable {
     public var toggleHotkey: HotkeyCombo
     public var secondaryBarMaxColumns: Int
     public var hasOpenedInitialSettings: Bool
+    public var pinnedSections: [String: MenuBarSection]
 
     public init(
         displayMode: DisplayMode = .secondaryBar,
@@ -352,7 +377,8 @@ public struct TidyBarSettings: Codable, Equatable, Sendable {
         hotkeyEnabled: Bool = true,
         toggleHotkey: HotkeyCombo = .defaultToggle,
         secondaryBarMaxColumns: Int = 12,
-        hasOpenedInitialSettings: Bool = false
+        hasOpenedInitialSettings: Bool = false,
+        pinnedSections: [String: MenuBarSection] = [:]
     ) {
         self.displayMode = displayMode
         self.autoRehideDelay = autoRehideDelay
@@ -364,6 +390,7 @@ public struct TidyBarSettings: Codable, Equatable, Sendable {
         self.toggleHotkey = toggleHotkey
         self.secondaryBarMaxColumns = max(4, min(20, secondaryBarMaxColumns))
         self.hasOpenedInitialSettings = hasOpenedInitialSettings
+        self.pinnedSections = pinnedSections
     }
 
     public init(from decoder: Decoder) throws {
@@ -380,6 +407,7 @@ public struct TidyBarSettings: Codable, Equatable, Sendable {
         let cols = try container.decodeIfPresent(Int.self, forKey: .secondaryBarMaxColumns) ?? def.secondaryBarMaxColumns
         secondaryBarMaxColumns = max(4, min(20, cols))
         hasOpenedInitialSettings = try container.decodeIfPresent(Bool.self, forKey: .hasOpenedInitialSettings) ?? true
+        pinnedSections = try container.decodeIfPresent([String: MenuBarSection].self, forKey: .pinnedSections) ?? [:]
     }
 
     public static let `default` = TidyBarSettings()

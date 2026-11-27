@@ -50,28 +50,34 @@ enum StatusItemDefaults {
     }
 
     /// 在创建 NSStatusItem 之前校验并修复 UserDefaults 中持久化的位置，彻底杜绝倒置或自锁
-    /// 注意 macOS 从右向左计位：0 在最右，1 在其紧邻左侧，nil 则交由系统置于最左。
+    /// 若 toggle 与 hiddenDivider 本身有效而仅 alwaysHiddenDivider 异常，则仅清理后者，绝不抹除用户调好的主分界位序。
     static func sanitizeBeforeCreation(alwaysHiddenEnabled: Bool, defaults: UserDefaults = .standard) {
         let togglePos = preferredPosition(for: AutosaveName.toggle, defaults: defaults)
         let hiddenPos = preferredPosition(for: AutosaveName.hiddenDivider, defaults: defaults)
-        let alwaysPos = alwaysHiddenEnabled
-            ? preferredPosition(for: AutosaveName.alwaysHiddenDivider, defaults: defaults)
-            : nil
 
-        if !SectionLayoutEngine.arePreferredPositionsOrdered(
+        guard SectionLayoutEngine.arePreferredPositionsOrdered(
             togglePos: togglePos,
             hiddenPos: hiddenPos,
-            alwaysPos: alwaysPos
-        ) {
+            alwaysPos: nil
+        ) else {
             resetToCleanOrder(defaults: defaults)
             return
         }
 
-        setVisible(true, for: AutosaveName.toggle, defaults: defaults)
-        setVisible(true, for: AutosaveName.hiddenDivider, defaults: defaults)
         if alwaysHiddenEnabled {
+            let alwaysPos = preferredPosition(for: AutosaveName.alwaysHiddenDivider, defaults: defaults)
+            if let alwaysPos, !SectionLayoutEngine.arePreferredPositionsOrdered(
+                togglePos: togglePos,
+                hiddenPos: hiddenPos,
+                alwaysPos: alwaysPos
+            ) {
+                setPreferredPosition(nil, for: AutosaveName.alwaysHiddenDivider, defaults: defaults)
+            }
             setVisible(true, for: AutosaveName.alwaysHiddenDivider, defaults: defaults)
         }
+
+        setVisible(true, for: AutosaveName.toggle, defaults: defaults)
+        setVisible(true, for: AutosaveName.hiddenDivider, defaults: defaults)
     }
 
     /// 清空异常位置并将主开关与分割线重置为 Ice 风格的干净初始位序（toggle=0, hidden=1, always=nil）

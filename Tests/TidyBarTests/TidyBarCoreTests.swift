@@ -538,4 +538,89 @@ final class TidyBarCoreTests: XCTestCase {
             screenMaxX: 1800
         ))
     }
+
+    func testArePreferredPositionsOrderedAllowsCollapsedAlwaysHiddenOffset() {
+        // 真实重启后采集到的有效位序：toggle=164, hidden=204, always=5815（因 hidden 撑开 5016pt 所致）
+        XCTAssertTrue(SectionLayoutEngine.arePreferredPositionsOrdered(
+            togglePos: 164,
+            hiddenPos: 204,
+            alwaysPos: 5815
+        ))
+        XCTAssertTrue(SectionLayoutEngine.arePreferredPositionsOrdered(
+            togglePos: 220,
+            hiddenPos: 260,
+            alwaysPos: 11500
+        ))
+        // 极端越界 (>= 25000) 仍应判为异常
+        XCTAssertFalse(SectionLayoutEngine.arePreferredPositionsOrdered(
+            togglePos: 164,
+            hiddenPos: 204,
+            alwaysPos: 30000
+        ))
+    }
+
+    func testStableKeyAndPinnedSectionsPersistenceCompatibility() throws {
+        XCTAssertEqual(
+            MenuBarItemInfo.makeStableKey(bundleIdentifier: "com.tencent.xinWeChat", ownerName: "微信", title: ""),
+            "com.tencent.xinWeChat"
+        )
+        XCTAssertEqual(
+            MenuBarItemInfo.makeStableKey(bundleIdentifier: "com.apple.controlcenter", ownerName: "控制中心", title: "WiFi"),
+            "com.apple.controlcenter::WiFi"
+        )
+        XCTAssertEqual(
+            MenuBarItemInfo.makeStableKey(bundleIdentifier: nil, ownerName: "QuickSnap", title: "QuickSnap"),
+            "QuickSnap::QuickSnap"
+        )
+
+        var settings = TidyBarSettings.default
+        settings.pinnedSections = [
+            "com.tencent.xinWeChat": .visible,
+            "com.kingsoft.wpsoffice": .hidden,
+            "com.apple.controlcenter::Battery": .alwaysHidden
+        ]
+        let encoded = try JSONEncoder().encode(settings)
+        let decoded = try JSONDecoder().decode(TidyBarSettings.self, from: encoded)
+        XCTAssertEqual(decoded.pinnedSections, settings.pinnedSections)
+    }
+
+    func testComputeDriftedItemsFiltersSystemPinnedAndOrdersMoves() {
+        let items: [MenuBarItemInfo] = [
+            // 时钟与控制中心主体不可被归位逻辑误拖
+            MenuBarItemInfo(windowID: 1, ownerPID: 10, ownerName: "控制中心", bundleIdentifier: "com.apple.controlcenter", title: "Clock", cgFrame: CGRect(x: 1680, y: 0, width: 120, height: 43), section: .visible, isOnScreen: true),
+            // 微信应为常显，却被重启挤进了隐藏区 -> 应最先移回 .visible
+            MenuBarItemInfo(windowID: 2, ownerPID: 20, ownerName: "微信", bundleIdentifier: "com.tencent.xinWeChat", title: "", cgFrame: CGRect(x: -3600, y: 0, width: 38, height: 43), section: .hidden, isOnScreen: false),
+            // WPS 被晚启动插到 alwaysHidden，而用户记忆为 .hidden -> 移回 .hidden
+            MenuBarItemInfo(windowID: 3, ownerPID: 30, ownerName: "WPS", bundleIdentifier: "com.kingsoft.wps", title: "", cgFrame: CGRect(x: -9000, y: 0, width: 34, height: 43), section: .alwaysHidden, isOnScreen: false),
+            // EasyConnect 已处于目标区 .hidden -> 不出现在漂移列表
+            MenuBarItemInfo(windowID: 4, ownerPID: 40, ownerName: "EasyConnect", bundleIdentifier: "com.sangfor.EasyConnect", title: "", cgFrame: CGRect(x: -4000, y: 0, width: 32, height: 43), section: .hidden, isOnScreen: false),
+            // 电池记忆为 .alwaysHidden，关闭总是隐藏区时应自动降级到 .hidden
+            MenuBarItemInfo(windowID: 5, ownerPID: 10, ownerName: "控制中心", bundleIdentifier: "com.apple.controlcenter", title: "Battery", cgFrame: CGRect(x: 1550, y: 0, width: 76, height: 43), section: .visible, isOnScreen: true)
+        ]
+        let pinned: [String: MenuBarSection] = [
+            "com.apple.controlcenter::Clock": .hidden,
+            "com.tencent.xinWeChat": .visible,
+            "com.kingsoft.wps": .hidden,
+            "com.sangfor.EasyConnect": .hidden,
+            "com.apple.controlcenter::Battery": .alwaysHidden
+        ]
+
+        let driftedWithAlways = SectionLayoutEngine.computeDriftedItems(
+            items: items,
+            pinnedSections: pinned,
+            enableAlwaysHiddenSection: true,
+            screenMaxX: 1800
+        )
+        XCTAssertEqual(driftedWithAlways.map(\.item.windowID), [2, 3, 5])
+        XCTAssertEqual(driftedWithAlways.map(\.targetSection), [.visible, .hidden, .alwaysHidden])
+
+        let driftedWithoutAlways = SectionLayoutEngine.computeDriftedItems(
+            items: items,
+            pinnedSections: pinned,
+            enableAlwaysHiddenSection: false,
+            screenMaxX: 1800
+        )
+        XCTAssertEqual(driftedWithoutAlways.map(\.item.windowID), [2, 3, 5])
+        XCTAssertEqual(driftedWithoutAlways.map(\.targetSection), [.visible, .hidden, .hidden])
+    }
 }

@@ -19,6 +19,7 @@ struct MenuBarActions {
     let scanAll: () async -> FullMenuBarSnapshot
     let moveItem: (MenuBarItemInfo, MenuBarSection) async -> MenuBarMoveResult
     let alignDivider: () async -> MenuBarMoveResult
+    let saveCurrentLayout: () async -> Int
 }
 
 // ============================================================================
@@ -168,6 +169,17 @@ private final class SettingsViewModel: ObservableObject {
         let result = await menuBarActions.alignDivider()
         applyMoveResult(result, successMessage: "已将分割线校准到主开关旁，中间图标已收纳隐藏")
         await refreshIcons()
+        isBusyMoving = false
+    }
+
+    func saveCurrentLayout() async {
+        guard !isBusyMoving else { return }
+        isBusyMoving = true
+        let count = await menuBarActions.saveCurrentLayout()
+        iconStatusIsError = count == 0
+        iconStatusMessage = count > 0
+            ? "已记住当前 \(count) 个图标的分区规则，重启后将自动恢复"
+            : "暂未扫描到可记住的菜单栏图标"
         isBusyMoving = false
     }
 
@@ -373,14 +385,23 @@ private struct IconManagerTab: View {
                     Text("菜单栏图标分区管理")
                         .font(.subheadline.weight(.medium))
                 }
-                Text("点击按钮即可自动将图标移入对应分组，无需手动拖拽。")
+                Text("点击按钮即可自动将图标移入对应分组；重启后将按规则自动恢复。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if !vm.settings.pinnedSections.isEmpty {
+                    Text("已记住 \(vm.settings.pinnedSections.count) 条分区规则，应用或系统重启后自动归位。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
             Spacer()
             if vm.isBusyMoving {
                 ProgressView().controlSize(.small)
             }
+            Button("记住当前布局") {
+                Task { await vm.saveCurrentLayout() }
+            }
+            .disabled(vm.isBusyMoving)
             Button {
                 Task { await vm.refreshIcons() }
             } label: {
